@@ -1,0 +1,19 @@
+# Render 部署配置 (Blueprint)。在 Render 里 New → Blueprint，选这个仓库即可。
+services:
+  - type: web
+    name: mise
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install --omit=dev
+    startCommand: node server/server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: TZ
+        value: Europe/Budapest
+      - key: BASIC_USER
+        value: mise
+      - key: BASIC_PASS
+        sync: false   # 创建时 Render 会让你填，不写进代码
