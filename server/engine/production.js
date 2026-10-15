@@ -1,11 +1,16 @@
 // 生产计划：计划 → 任务看板 → 完成入库
 import { all, get, ins, run, tx } from '../db.js';
-import { dayAdd, explode, fail, now, recipeCost, today } from './core.js';
+import { dayAdd, explode, fail, now, ready, recipeCost, today } from './core.js';
 import { addMove, consumeRecipe, onHand } from './stock.js';
+
+const stockMap = async (outlet) =>
+  new Map((await all('SELECT item_type, item_id, SUM(qty) q FROM stock_moves WHERE outlet_id=? GROUP BY item_type, item_id', outlet))
+    .map((s) => [`${s.item_type}:${s.item_id}`, s.q]));
 
 // 加一个配方到计划时，它用到的【可入库】子配方也得有人做。
 // 返回这些子配方各需要多少、现有多少 —— 界面据此让用户勾选"库存够，不用做"。
-export function subRecipeNeeds(outlet, recipeId, qty) {
+export async function subRecipeNeeds(outlet, recipeId, qty) {
+  await ready();
   const out = new Map();
   const walk = (rid, q) => {
     const c = recipeCost(rid);
@@ -22,36 +27,38 @@ export function subRecipeNeeds(outlet, recipeId, qty) {
     }
   };
   walk(recipeId, qty);
-  return [...out.values()].map((s) => ({ ...s, on_hand: onHand(outlet, 'recipe', s.recipe_id) }));
+  const stock = await stockMap(outlet);
+  return [...out.values()].map((s) => ({ ...s, on_hand: stock.get(`recipe:${s.recipe_id}`) || 0 }));
 }
 
-export function savePlan(p) {
-  return tx(() => {
+export async function savePlan(p) {
+  return tx(async () => {
     let id = p.id;
     if (id) {
-      const cur = get('SELECT status FROM production_plans WHERE id=?', id) || fail('计划不存在 plan not found');
+      const cur = (await get('SELECT status FROM production_plans WHERE id=?', id)) || fail('计划不存在 plan not found');
       if (cur.status !== 'draft') fail('只能修改草稿状态的计划 only draft plans can be edited');
-      run('UPDATE production_plans SET name=?, plan_date=? WHERE id=?', p.name, p.plan_date || today(), id);
-      run('DELETE FROM production_tasks WHERE plan_id=?', id);
+      await run('UPDATE production_plans SET name=?, plan_date=? WHERE id=?', p.name, p.plan_date || today(), id);
+      await run('DELETE FROM production_tasks WHERE plan_id=?', id);
     } else {
-      id = ins('INSERT INTO production_plans (outlet_id,name,plan_date,created_at) VALUES (?,?,?,?)', p.outlet_id, p.name || '生产计划', p.plan_date || today(), now());
+      id = await ins('INSERT INTO production_plans (outlet_id,name,plan_date,created_at) VALUES (?,?,?,?)', p.outlet_id, p.name || '生产计划', p.plan_date || today(), now());
     }
     for (const t of p.tasks || []) {
       if (t.recipe_id) {
         if (!(+t.qty > 0)) continue;
-        ins('INSERT INTO production_tasks (plan_id,recipe_id,qty,assignee,workstation) VALUES (?,?,?,?,?)', id, t.recipe_id, +t.qty, t.assignee || '', t.workstation || '');
+        await ins('INSERT INTO production_tasks (plan_id,recipe_id,qty,assignee,workstation) VALUES (?,?,?,?,?)', id, t.recipe_id, +t.qty, t.assignee || '', t.workstation || '');
       } else if (t.title) {
-        ins('INSERT INTO production_tasks (plan_id,title,assignee,workstation) VALUES (?,?,?,?)', id, t.title, t.assignee || '', t.workstation || '');
+        await ins('INSERT INTO production_tasks (plan_id,title,assignee,workstation) VALUES (?,?,?,?)', id, t.title, t.assignee || '', t.workstation || '');
       }
     }
     return id;
   });
 }
 
-export function getPlan(id) {
-  const p = get('SELECT * FROM production_plans WHERE id=?', id) || fail('计划不存在 plan not found');
+export async function getPlan(id) {
+  await ready();
+  const p = (await get('SELECT * FROM production_plans WHERE id=?', id)) || fail('计划不存在 plan not found');
   const memo = new Map();
-  p.tasks = all('SELECT * FROM production_tasks WHERE plan_id=? ORDER BY id', id).map((t) => {
+  p.tasks = (await all('SELECT * FROM production_tasks WHERE plan_id=? ORDER BY id', id)).map((t) => {
     if (!t.recipe_id) return { ...t, labour: 0, cost: 0 };
     const c = recipeCost(t.recipe_id, memo);
     const f = t.qty / c.yield_qty;
@@ -65,8 +72,9 @@ export function getPlan(id) {
     const k = `recipe:${t.recipe_id}`;
     if (t.recipe_id && need.has(k)) need.get(k).qty -= t.qty;
   }
+  const stock = await stockMap(p.outlet_id);
   p.bom = [...need.values()].filter((n) => n.qty > 1e-9).map((n) => {
-    const have = onHand(p.outlet_id, n.item_type, n.item_id);
+    const have = stock.get(`${n.item_type}:${n.item_id}`) || 0;
     return { ...n, need: n.qty, on_hand: have, short: Math.max(0, n.qty - Math.max(0, have)), cost: n.qty * n.unit_cost };
   });
   // 食材预算按物料清单算 (本计划自产的半成品不重复计)
@@ -78,30 +86,30 @@ export const listPlans = (outlet) =>
               (SELECT COUNT(*) FROM production_tasks t WHERE t.plan_id=p.id AND t.status='done') done
        FROM production_plans p WHERE outlet_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, id DESC LIMIT 100`, outlet);
 
-export function activatePlan(id) {
-  const p = getPlan(id);
+export async function activatePlan(id) {
+  const p = await getPlan(id);
   if (p.status !== 'draft') fail('计划已激活 already active');
   if (!p.tasks.length) fail('计划里没有任务 the plan has no tasks');
-  run("UPDATE production_plans SET status='active' WHERE id=?", id);
+  await run("UPDATE production_plans SET status='active' WHERE id=?", id);
 }
-export function deletePlan(id) {
-  const p = get('SELECT status FROM production_plans WHERE id=?', id);
+export async function deletePlan(id) {
+  const p = await get('SELECT status FROM production_plans WHERE id=?', id);
   if (p?.status === 'done') fail('已完成的计划不能删除 finished plans cannot be deleted');
-  run('DELETE FROM production_plans WHERE id=?', id);
+  await run('DELETE FROM production_plans WHERE id=?', id);
 }
 
 // 任务状态：todo → doing (开始计时) → done。也可以"全部标记完成"(那样就没有耗时记录)。
-export function setTaskStatus(taskId, status, ts) {
-  const t = get('SELECT t.*, p.status plan_status FROM production_tasks t JOIN production_plans p ON p.id=t.plan_id WHERE t.id=?', taskId) || fail('任务不存在 task not found');
+export async function setTaskStatus(taskId, status, ts) {
+  const t = (await get('SELECT t.*, p.status plan_status FROM production_tasks t JOIN production_plans p ON p.id=t.plan_id WHERE t.id=?', taskId)) || fail('任务不存在 task not found');
   if (t.plan_status !== 'active') fail('计划不在进行中 plan is not active');
   const at = ts || now();
-  if (status === 'doing') run("UPDATE production_tasks SET status='doing', started_at=?, done_at=NULL WHERE id=?", at, taskId);
-  else if (status === 'done') run("UPDATE production_tasks SET status='done', done_at=? WHERE id=?", at, taskId);
-  else if (status === 'todo') run("UPDATE production_tasks SET status='todo', started_at=NULL, done_at=NULL WHERE id=?", taskId);
+  if (status === 'doing') await run("UPDATE production_tasks SET status='doing', started_at=?, done_at=NULL WHERE id=?", at, taskId);
+  else if (status === 'done') await run("UPDATE production_tasks SET status='done', done_at=? WHERE id=?", at, taskId);
+  else if (status === 'todo') await run("UPDATE production_tasks SET status='todo', started_at=NULL, done_at=NULL WHERE id=?", taskId);
   else fail('未知状态 unknown status');
 }
-export function markAllDone(planId) {
-  run("UPDATE production_tasks SET status='done', done_at=COALESCE(done_at, ?) WHERE plan_id=?", now(), planId);
+export async function markAllDone(planId) {
+  await run("UPDATE production_tasks SET status='done', done_at=COALESCE(done_at, ?) WHERE plan_id=?", now(), planId);
 }
 
 // 完成计划。所有任务必须已完成。对每个【可入库】配方的任务 (可以选择不入库)：
@@ -109,11 +117,11 @@ export function markAllDone(planId) {
 //   · 入库单位成本 = 投入成本 ÷ 实际产出  → 出成率低，这批就贵
 //   · 自动生成批号和效期 (生产日 + 保质期天数)，并把领料用到的批次记为它的"父批次"
 // 先做层级低的 (被别人用的)，这样上层任务领料时能领到刚做好的半成品。
-export function finishPlan(id, outputs = [], ts) {
-  const p = getPlan(id);
+export async function finishPlan(id, outputs = [], ts) {
+  const p = await getPlan(id);
   if (p.status !== 'active') fail('计划不在进行中 plan is not active');
   if (p.tasks.some((t) => t.status !== 'done')) fail('还有任务没完成 all tasks must be done first');
-  return tx(() => {
+  return tx(async () => {
     const at = ts || now();
     const result = [];
     for (const t of p.tasks.filter((x) => x.recipe_id && x.stockable).sort((a, b) => a.depth - b.depth || a.id - b.id)) {
@@ -123,27 +131,30 @@ export function finishPlan(id, outputs = [], ts) {
       if (!(produced > 0)) continue;
       const lotNo = o.lot_no || `P${id}-${t.id}`;
       const expiry = o.expiry || (t.shelf_life_days ? dayAdd(at.slice(0, 10), t.shelf_life_days) : null);
-      const used = consumeRecipe(p.outlet_id, t.recipe_id, t.qty, 'production_out', `PT${t.id}`, at);
-      addMove({ ts: at, outlet_id: p.outlet_id, item_type: 'recipe', item_id: t.recipe_id, qty: produced, unit_cost: used.cost / produced,
+      const used = await consumeRecipe(p.outlet_id, t.recipe_id, t.qty, 'production_out', `PT${t.id}`, at);
+      await addMove({ ts: at, outlet_id: p.outlet_id, item_type: 'recipe', item_id: t.recipe_id, qty: produced, unit_cost: used.cost / produced,
         reason: 'production_in', ref: `PT${t.id}`, lot: { lot_no: lotNo, expiry, parents: used.lots } });
-      run('UPDATE production_tasks SET produced_qty=?, lot_no=?, expiry=? WHERE id=?', produced, lotNo, expiry, t.id);
+      await run('UPDATE production_tasks SET produced_qty=?, lot_no=?, expiry=? WHERE id=?', produced, lotNo, expiry, t.id);
       result.push({ task_id: t.id, recipe_id: t.recipe_id, produced, lot_no: lotNo, expiry, unit_cost: used.cost / produced });
     }
-    run("UPDATE production_plans SET status='done', finished_at=? WHERE id=?", at, id);
+    await run("UPDATE production_plans SET status='done', finished_at=? WHERE id=?", at, id);
     return result;
   });
 }
 
 // 生产建议：半成品 现存 + 已计划 < 最低量 → 补到 par，向上取整到整批
-export function productionSuggestions(outlet) {
-  return all("SELECT * FROM par_levels WHERE outlet_id=? AND item_type='recipe' AND min_qty>0", outlet).map((s) => {
+export async function productionSuggestions(outlet) {
+  await ready();
+  const out = [];
+  for (const s of await all("SELECT * FROM par_levels WHERE outlet_id=? AND item_type='recipe' AND min_qty>0", outlet)) {
     const c = recipeCost(s.item_id);
-    const have = onHand(outlet, 'recipe', s.item_id);
-    const planned = get(`SELECT COALESCE(SUM(t.qty),0) q FROM production_tasks t JOIN production_plans p ON p.id=t.plan_id
-                         WHERE p.outlet_id=? AND p.status IN ('draft','active') AND t.recipe_id=?`, outlet, s.item_id).q;
-    if (have + planned >= s.min_qty) return null;
+    const have = await onHand(outlet, 'recipe', s.item_id);
+    const planned = (await get(`SELECT COALESCE(SUM(t.qty),0) q FROM production_tasks t JOIN production_plans p ON p.id=t.plan_id
+                                WHERE p.outlet_id=? AND p.status IN ('draft','active') AND t.recipe_id=?`, outlet, s.item_id)).q;
+    if (have + planned >= s.min_qty) continue;
     const batches = Math.max(1, Math.ceil((s.par_qty - have - planned) / c.yield_qty - 1e-9));
-    return { recipe_id: s.item_id, name_zh: c.name_zh, name_en: c.name_en, unit: c.yield_unit, on_hand: have, planned, min_qty: s.min_qty, par_qty: s.par_qty,
-      batches, batch_size: c.yield_qty, qty: batches * c.yield_qty };
-  }).filter(Boolean);
+    out.push({ recipe_id: s.item_id, name_zh: c.name_zh, name_en: c.name_en, unit: c.yield_unit, on_hand: have, planned, min_qty: s.min_qty, par_qty: s.par_qty,
+      batches, batch_size: c.yield_qty, qty: batches * c.yield_qty });
+  }
+  return out;
 }

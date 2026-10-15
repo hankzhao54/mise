@@ -20,28 +20,47 @@
 | | 销售看板 / 菜单工程 | 利润与毛利率、销售构成、四象限矩阵 |
 | 洞察 | 管理报表 | 毛利报告（理论 vs 实际）、期间库存、盘点差异、报损报表 |
 | | 批次追溯 | 从任一批号向上查到原料和供应商、向下查到门店和销售 |
+| 管理 | 账号 / 门店 / 操作记录 / 数据 | 登录、角色与门店范围、审批和主数据权限、谁在什么时候改了什么、清空或装入示例数据 |
 | | 设置 | 成本默认值、时薪、盲盘、审批限额等 |
 
 界面中英文可切换。金额单位是 Ft（在 `client/src/lib.jsx` 的 `money` 里改）。
 
 ## 运行
 
-需要 Node.js 22.13 以上（用到自带的 `node:sqlite`，不用装数据库）。
+需要 Node.js 22.13 以上。数据库是 PostgreSQL：
+
+- **本地**：什么都不用装。没有设置 `DATABASE_URL` 时，用内嵌的 Postgres（PGlite），数据存在项目下的 `pgdata/`。
+- **正式环境**：设置 `DATABASE_URL` 指向一个 Postgres（我们用 Supabase）。表都建在 `mise` 这个 schema 里，和同一个库里别的应用互不干扰。
 
 ```bash
 npm install
-npm start          # 打开 http://localhost:3001
+ADMIN_PASSWORD=至少8位的密码 npm start     # 打开 http://localhost:3001，用户名 admin
 ```
 
-第一次启动会自动生成示例数据：1 个中央厨房 + 2 家门店、14 天销售，以及每个模块各一点已发生的业务。
-数据存在 `mise-v2.db`（第一版的 `data.db` 不再使用，可以删掉）。
+第一次启动会：
+1. 建一个管理员账号。用户名取 `ADMIN_USER`（默认 `admin`），密码取 `ADMIN_PASSWORD`；没设密码就随机生成一个，打印在启动日志里。
+2. 装入示例数据：1 个中央厨房 + 2 家门店、14 天销售，以及每个模块各一点已发生的业务。只装这一次；设 `SEED_DEMO=0` 可以不装。
 
 ```bash
-npm run seed       # 清空并重建示例数据
-npm test           # 逐条核对 22 组规则（用临时数据库，不影响你的数据）
+npm run seed              # 清空并重建示例数据 (账号保留)
+npm test                  # 逐条核对 22 组规则（用内存数据库，不影响你的数据）
 ```
 
 改前端时开两个终端：`npm run dev:api` 和 `npm run dev:web`（http://localhost:5173，热更新），改完 `npm run build` 重新生成 `dist/`。
+
+## 账号与权限
+
+| 角色 | 能做什么 |
+| --- | --- |
+| 管理员 | 全部功能，加上账号、门店、设置、操作记录、清空数据 |
+| 管理人员 | 日常操作：订货、收货、库存、盘点、生产、任务、销售、报表 |
+
+管理人员还有三个开关：
+- **门店范围**：只能看、只能操作勾选的门店（不勾 = 全部）。服务端对每个请求都检查，不只是界面上藏起来。
+- **审批订单**：能批准 / 拒绝超过限额的订单。
+- **改主数据**：能改配方、原料与价格、供应商、菜单、HACCP 控制点。
+
+登录用会话 Cookie（HttpOnly，30 天），密码用 scrypt 加盐哈希存储。每一次成功的修改和登录都会写进操作记录。
 
 ## 文档
 
@@ -54,7 +73,8 @@ npm test           # 逐条核对 22 组规则（用临时数据库，不影响�
 ## 代码地图
 
 ```
-server/db.js                表结构。先读这个
+server/db.js                数据库连接 + 表结构。先读这个
+server/auth.js              密码、会话、权限
 server/engine/core.js       设置、单位换算、配方成本、配方展开
 server/engine/stock.js      库存台账、批次、报损、调拨、盘点、追溯
 server/engine/procurement.js  订货建议、订单与审批、收货、内部订货、BoM
@@ -62,13 +82,14 @@ server/engine/production.js 生产计划
 server/engine/haccp.js      任务与 HACCP
 server/engine/sales.js      POS 关联、销售、菜单、销售看板
 server/engine/reports.js    报表
-server/server.js            HTTP 路由，只做转发
+server/server.js            HTTP 路由：登录、权限检查、操作记录，然后转给 engine
 server/seed.js              示例数据
 client/src/                 React 界面，文件名和上面的分组对应
 ```
 
 ## 建议的上手顺序
 
+0. 用管理员登录。到 **账号** 给自己建一个“管理人员”账号试试门店范围和权限。
 1. **配方** → 点开「叉烧拉面」→「财务」：看成本怎么从原料一层层算上来，为什么毛利率没达标。
 2. **设置** → 把默认损耗改成 5% 再回去看：所有成本立刻变了。
 3. 切到**中央厨房** → **订货**：鲜肉坊的订单会超限额，走一遍审批；再收货，改一个实付单价，看原料的价格历史。
@@ -80,10 +101,19 @@ client/src/                 React 界面，文件名和上面的分组对应
 9. **盘点**：开始盘点，故意少盘一点 → 查看差异 → 确认。
 10. **管理报表**：理论成本和实际成本差了多少，差在哪。
 
-## 部署到公网（Render）
+## 部署（Render + Supabase）
 
-仓库里的 `render.yaml` 已经配好。在 Render 里选 New → Blueprint，连接这个 GitHub 仓库，按提示填一个 `BASIC_PASS`（访问密码），等它构建完成即可。
+仓库里的 `render.yaml` 已经配好（New → Blueprint 选这个仓库）。需要的环境变量：
 
-- 打开网址时浏览器会要用户名和密码：用户名是 `mise`，密码是你填的 `BASIC_PASS`。两个环境变量都不设时不启用密码（本地运行就是这样）。
-- 免费档没有持久磁盘：服务休眠或重新部署后，数据会回到示例数据。要保留数据，需要换成带磁盘的付费档，并把环境变量 `DB_PATH` 指到磁盘上。
-- 免费档一段时间没人访问会休眠，下次打开要等几十秒。
+| 变量 | 说明 |
+| --- | --- |
+| `DATABASE_URL` | Supabase 的连接串。用 **Session pooler**（端口 5432）那一条，不要用 Direct connection（Render 连不上 IPv6）也不要用 Transaction pooler（6543） |
+| `ADMIN_USER` / `ADMIN_PASSWORD` | 第一次启动建的管理员。没设时沿用 `BASIC_USER` / `BASIC_PASS` |
+| `SEED_DEMO` | 设为 `0` 时第一次启动不装示例数据 |
+| `TZ` | 业务日期按这个时区算（`Europe/Budapest`） |
+
+Supabase 这边：新建（或沿用）一个项目，区域选 Frankfurt（eu-central-1，和 Render 同城），在 Connect 里复制 Session pooler 的连接串，把 `[YOUR-PASSWORD]` 换成数据库密码，贴到 Render 的 `DATABASE_URL`。表会在启动时自动建好。
+
+- 没设 `DATABASE_URL` 时用内嵌数据库，存在服务器磁盘上；Render 免费档重新部署会丢，所以线上一定要接 Supabase。
+- Supabase 免费项目一周没有访问会暂停，需要在 Supabase 后台点恢复；正式用建议升级。
+- Render 免费档一段时间没人访问会休眠，下次打开要等几十秒。

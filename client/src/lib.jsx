@@ -4,6 +4,8 @@ import { createContext, useCallback, useContext, useEffect, useState } from 'rea
 async function req(method, url, body) {
   const r = await fetch('/api' + url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json().catch(() => ({}));
+  // 登录过期 / 被停用：通知 App 回到登录页
+  if (r.status === 401 && url !== '/login') window.dispatchEvent(new Event('mise:signed-out'));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 }
@@ -15,6 +17,7 @@ const T = {
   stock: ['库存', 'Stock'], counts: ['盘点', 'Counts'], orders: ['订货', 'Ordering'], internal: ['内部订货', 'Internal orders'], production: ['生产计划', 'Production plan'],
   tasks: ['任务与 HACCP', 'Tasks & HACCP'], sales: ['销售与 POS', 'Sales & POS'], salesdash: ['销售看板', 'Sales dashboard'], menu: ['菜单工程', 'Menu engineering'],
   insights: ['管理报表', 'Management figures'], trace: ['批次追溯', 'Traceability'], settings: ['设置', 'Settings'],
+  g_admin: ['管理', 'Admin'], users: ['账号', 'Users'], outlets: ['门店', 'Outlets'], audit: ['操作记录', 'Audit log'], data: ['数据', 'Data'],
   g_products: ['产品', 'Products'], g_procurement: ['采购', 'Procurement'], g_inventory: ['库存', 'Inventory'], g_planning: ['计划', 'Planning'], g_sales: ['销售', 'Sales'], g_insights: ['洞察', 'Insights'],
   name: ['名称', 'Name'], name_zh: ['中文名', 'Chinese name'], name_en: ['英文名', 'English name'], category: ['类别', 'Category'], unit: ['单位', 'Unit'],
   base_unit: ['基础单位', 'Base unit'], unit_cost: ['单位成本', 'Unit cost'], allergens: ['过敏原', 'Allergens'], packages: ['采购包装', 'Packages'],

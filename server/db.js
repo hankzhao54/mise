@@ -1,115 +1,239 @@
-// 数据库层：建表 + 几个最小的查询助手。
-// 用 Node 自带的 node:sqlite，无需安装任何数据库。
-// 表结构就是整个系统的骨架 —— 建议先通读这个文件。
-import { DatabaseSync } from 'node:sqlite';
+// 数据库层：PostgreSQL。
+//   · 设置了 DATABASE_URL → 连接外部 Postgres (生产环境用 Supabase)
+//   · 没设置 → 用内嵌的 Postgres (PGlite)，数据存在项目下的 pgdata/ 目录，本地开发和测试用
+// 两种情况跑的是同一套 SQL。表都建在一个独立的 schema 里 (默认 mise)，
+// 所以和别的应用共用一个 Supabase 项目也不会互相干扰。
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import pg from 'pg';
 
-const dir = path.dirname(fileURLToPath(import.meta.url));
-// v2 换了表结构，所以换一个文件名；旧的 data.db 不会被动
-export const DB_PATH = process.env.DB_PATH || path.join(dir, '..', 'mise-v2.db');
-export const db = new DatabaseSync(DB_PATH);
+const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const SCHEMA = (process.env.DB_SCHEMA || 'mise').replace(/[^a-z0-9_]/gi, '');
 
-db.exec(`
-PRAGMA foreign_keys = ON;
+// ── 请求上下文 ──
+// 每个 HTTP 请求有一个上下文：里面放当前事务 (tx) 和共享状态 (shared，比如配方目录缓存)。
+// 不在请求里的代码 (示例数据、测试) 用全局上下文。
+const als = new AsyncLocalStorage();
+const GLOBAL = { shared: {} };
+export const store = () => als.getStore() ?? GLOBAL;
+export const withContext = (fn) => als.run({ shared: {} }, fn);
 
--- ══════════ 全局设置 (Library settings) ══════════
+let driver = null;
+export const dbKind = () => driver?.kind;
+
+export async function connect() {
+  if (driver) return driver;
+  if (process.env.DATABASE_URL) {
+    pg.types.setTypeParser(20, Number);        // bigint (COUNT) → number
+    pg.types.setTypeParser(1700, parseFloat);  // numeric → number
+    // 连接串里的 sslmode 会让 pg 严格校验证书 (Supabase 连接池会因此报 self-signed)，去掉它，由下面的 ssl 选项决定
+    const url = process.env.DATABASE_URL.trim().replace(/([?&])sslmode=[^&]*&?/, '$1').replace(/[?&]$/, '');
+    const local = /@(localhost|127\.0\.0\.1)[:/]/.test(url);
+    const pool = new pg.Pool({ connectionString: url, ssl: local ? false : { rejectUnauthorized: false }, max: 5 });
+    pool.on('error', (e) => console.error('数据库连接出错 db pool error:', e.message));
+    // 每条新连接先设好 search_path (指向我们的 schema)，再交给业务用。
+    // 所以 Supabase 要用 Session pooler (5432 端口)：同一条连接上的设置会一直有效。
+    const prepared = new WeakSet(), queues = new WeakMap();
+    const client = async () => {
+      const c = await pool.connect();
+      if (!prepared.has(c)) { await c.query(`SET search_path TO ${SCHEMA}`); prepared.add(c); }
+      return c;
+    };
+    driver = {
+      kind: 'postgres',
+      async query(sql, params, txClient) {
+        if (txClient) {
+          // 同一个事务里的查询排队执行 (代码里有 Promise.all 并发查询，一条连接同一时刻只能跑一条)
+          const run = (queues.get(txClient) || Promise.resolve()).then(() => txClient.query(sql, params));
+          queues.set(txClient, run.catch(() => {}));
+          return run;
+        }
+        const c = await client();
+        try { return await c.query(sql, params); } finally { c.release(); }
+      },
+      async transaction(fn) {
+        const c = await client();
+        try {
+          await c.query('BEGIN');
+          const r = await fn(c);
+          await c.query('COMMIT');
+          return r;
+        } catch (e) {
+          await c.query('ROLLBACK').catch(() => {});
+          throw e;
+        } finally { c.release(); }
+      },
+      end: () => pool.end(),
+    };
+  } else {
+    const { PGlite } = await import('@electric-sql/pglite');
+    const dir = process.env.PGLITE_DIR || path.join(root, 'pgdata');
+    const db = dir === 'memory' ? new PGlite() : new PGlite(dir);
+    await db.waitReady;
+    driver = {
+      kind: 'embedded',
+      query: (sql, params, client) => (client || db).query(sql, params),
+      transaction: (fn) => db.transaction(fn),
+      end: () => db.close(),
+    };
+  }
+  await driver.query(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA}`);
+  await driver.query(`SET search_path TO ${SCHEMA}`);
+  await migrate();
+  return driver;
+}
+export const disconnect = async () => { if (driver) { await driver.end(); driver = null; } };
+
+// 代码里写 ? 占位符 (或 ?1 ?2 编号的)，这里转成 Postgres 的 $1 $2
+function toPg(sql) {
+  if (/\?\d/.test(sql)) return sql.replace(/\?(\d+)/g, '$$$1');
+  let i = 0;
+  return sql.replace(/\?/g, () => '$' + ++i);
+}
+async function q(sql, params) {
+  if (!driver) await connect();
+  const r = await driver.query(toPg(sql), params.map((v) => (v === undefined ? null : v)), store().tx);
+  return r;
+}
+export const all = async (sql, ...p) => (await q(sql, p)).rows;
+export const get = async (sql, ...p) => (await q(sql, p)).rows[0];
+export const run = async (sql, ...p) => { const r = await q(sql, p); return { changes: r.rowCount ?? r.affectedRows ?? 0 }; };
+export const ins = async (sql, ...p) => Number((await q(sql + ' RETURNING id', p)).rows[0].id);
+
+// 事务：一组写入要么全成功要么全回滚。嵌套调用时直接复用外层事务。
+export async function tx(fn) {
+  const cur = store();
+  if (cur.tx) return fn();
+  if (!driver) await connect();
+  try {
+    return await driver.transaction((client) => als.run({ tx: client, shared: cur.shared }, fn));
+  } catch (e) {
+    cur.shared.cat = null; // 回滚后，缓存里可能有没提交的数据
+    throw e;
+  }
+}
+
+// ══════════ 表结构 ══════════
+// 只增不改：每次启动执行一遍 (IF NOT EXISTS)，已经存在的表不会动。
+const DDL = `
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
--- ══════════ 主数据 ══════════
+-- ── 账号 ──
+-- role: admin 管理员 (全部权限，含用户和设置) | manager 管理人员 (日常操作)
+-- outlets: 能看哪些门店，JSON 数组；空数组 = 全部门店
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'manager' CHECK (role IN ('admin','manager')),
+  outlets TEXT NOT NULL DEFAULT '[]',
+  can_approve INTEGER NOT NULL DEFAULT 0,       -- 能审批超限额的订单
+  can_edit_master INTEGER NOT NULL DEFAULT 0,   -- 能改配方、原料、供应商、价格
+  password_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL, last_login_at TEXT
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+-- 操作记录：谁、什么时候、做了什么 (所有写操作)
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, ts TEXT NOT NULL,
+  user_id INTEGER, username TEXT NOT NULL DEFAULT '', method TEXT NOT NULL, path TEXT NOT NULL, summary TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts);
+
+-- ── 主数据 ──
 -- 门店 / 中央厨房。配方、原料属于"库"(全局)；库存、订单、生产、销售属于某个门店
 -- is_supplier=1 表示它是"内部供应商"，别的门店可以向它订货
 CREATE TABLE IF NOT EXISTS outlets (
-  id INTEGER PRIMARY KEY, name_zh TEXT NOT NULL, name_en TEXT NOT NULL,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name_zh TEXT NOT NULL, name_en TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('central_kitchen','restaurant')),
   is_supplier INTEGER NOT NULL DEFAULT 0
 );
-
 CREATE TABLE IF NOT EXISTS suppliers (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, contact TEXT DEFAULT '', lead_days INTEGER DEFAULT 1,
-  min_order REAL NOT NULL DEFAULT 0,      -- 最低起订金额：低于它只提醒，不拦截
-  delivery_fee REAL NOT NULL DEFAULT 0,   -- 默认运费：单独记录，不摊进原料成本
-  approval_limit REAL                     -- 每日订货限额；NULL = 沿用全局设置
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, contact TEXT DEFAULT '', lead_days INTEGER DEFAULT 1,
+  min_order DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 最低起订金额：低于它只提醒，不拦截
+  delivery_fee DOUBLE PRECISION NOT NULL DEFAULT 0,   -- 默认运费：单独记录，不摊进原料成本
+  approval_limit DOUBLE PRECISION                     -- 每日订货限额；NULL = 沿用全局设置
 );
-
 -- 原料：只定义"是什么"和基础单位，不含价格
 CREATE TABLE IF NOT EXISTS ingredients (
-  id INTEGER PRIMARY KEY, name_zh TEXT NOT NULL, name_en TEXT NOT NULL,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name_zh TEXT NOT NULL, name_en TEXT NOT NULL,
   category TEXT DEFAULT '', base_unit TEXT NOT NULL CHECK (base_unit IN ('g','ml','pc')),
   allergens TEXT NOT NULL DEFAULT '[]',
-  waste_pct REAL                          -- 原料级默认损耗；NULL = 沿用全局默认
+  waste_pct DOUBLE PRECISION                          -- 原料级默认损耗；NULL = 沿用全局默认
 );
-
 -- 采购包装：价格在这里。一个原料可以有多个供应商/包装
 CREATE TABLE IF NOT EXISTS packages (
-  id INTEGER PRIMARY KEY,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   ingredient_id INTEGER NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,
   supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
-  label TEXT NOT NULL, article_no TEXT DEFAULT '', pack_qty REAL NOT NULL, price REAL NOT NULL,
+  label TEXT NOT NULL, article_no TEXT DEFAULT '', pack_qty DOUBLE PRECISION NOT NULL, price DOUBLE PRECISION NOT NULL,
   orderable INTEGER NOT NULL DEFAULT 1, last_ordered_at TEXT
 );
 -- 价格历史：每次改价留一行
 CREATE TABLE IF NOT EXISTS package_prices (
-  id INTEGER PRIMARY KEY, package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
-  ts TEXT NOT NULL, price REAL NOT NULL, source TEXT DEFAULT ''
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+  ts TEXT NOT NULL, price DOUBLE PRECISION NOT NULL, source TEXT DEFAULT ''
 );
-
 -- 配方：prep = 半成品 (可被其他配方引用)，dish = 售卖菜品
 -- stockable=1 的半成品有实物库存 (提前做好入库)；=0 的现做现用，扣库存时继续往下拆到原料
 CREATE TABLE IF NOT EXISTS recipes (
-  id INTEGER PRIMARY KEY, name_zh TEXT NOT NULL, name_en TEXT NOT NULL,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name_zh TEXT NOT NULL, name_en TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('prep','dish')), stockable INTEGER NOT NULL DEFAULT 0,
-  category TEXT DEFAULT '', yield_qty REAL NOT NULL, yield_unit TEXT NOT NULL,
-  sell_price REAL DEFAULT 0,
-  vat_pct REAL,                           -- NULL = 沿用全局默认税率
-  target_margin REAL,                     -- NULL = 沿用全局目标毛利率
-  prep_min REAL NOT NULL DEFAULT 0, cook_min REAL NOT NULL DEFAULT 0, plate_min REAL NOT NULL DEFAULT 0,  -- 主动工时(分钟/批)
-  shelf_life_days INTEGER,                -- 保质期，生产入库时用来算效期
+  category TEXT DEFAULT '', yield_qty DOUBLE PRECISION NOT NULL, yield_unit TEXT NOT NULL,
+  sell_price DOUBLE PRECISION DEFAULT 0,
+  vat_pct DOUBLE PRECISION,                           -- NULL = 沿用全局默认税率
+  target_margin DOUBLE PRECISION,                     -- NULL = 沿用全局目标毛利率
+  prep_min DOUBLE PRECISION NOT NULL DEFAULT 0, cook_min DOUBLE PRECISION NOT NULL DEFAULT 0, plate_min DOUBLE PRECISION NOT NULL DEFAULT 0,
+  shelf_life_days INTEGER,                            -- 保质期，生产入库时用来算效期
   method TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS recipe_lines (
-  id INTEGER PRIMARY KEY,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   recipe_id INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
   ingredient_id INTEGER REFERENCES ingredients(id),
   sub_recipe_id INTEGER REFERENCES recipes(id),
-  qty REAL NOT NULL, unit TEXT NOT NULL,
-  waste_pct REAL,                         -- 行级损耗；NULL = 沿用原料/全局
+  qty DOUBLE PRECISION NOT NULL, unit TEXT NOT NULL,
+  waste_pct DOUBLE PRECISION,                         -- 行级损耗；NULL = 沿用原料/全局
   CHECK ((ingredient_id IS NULL) <> (sub_recipe_id IS NULL))
 );
-
--- 菜单 (套餐)：一组配方 + 一个套餐价，用来算整套成本和做配方间的对比
+-- 菜单 (套餐)
 CREATE TABLE IF NOT EXISTS menus (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL NOT NULL DEFAULT 0, vat_pct REAL, target_margin REAL
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, price DOUBLE PRECISION NOT NULL DEFAULT 0,
+  vat_pct DOUBLE PRECISION, target_margin DOUBLE PRECISION
 );
 CREATE TABLE IF NOT EXISTS menu_items (
-  id INTEGER PRIMARY KEY, menu_id INTEGER NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, menu_id INTEGER NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
   course TEXT NOT NULL DEFAULT '', recipe_id INTEGER NOT NULL REFERENCES recipes(id)
 );
 
--- ══════════ 库存 ══════════
+-- ── 库存 ──
 -- 台账：只追加，不修改；现存量 = SUM(qty)
 CREATE TABLE IF NOT EXISTS stock_moves (
-  id INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, ts TEXT NOT NULL,
   outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   item_type TEXT NOT NULL CHECK (item_type IN ('ingredient','recipe')),
-  item_id INTEGER NOT NULL, qty REAL NOT NULL, unit_cost REAL NOT NULL DEFAULT 0,
+  item_id INTEGER NOT NULL, qty DOUBLE PRECISION NOT NULL, unit_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
   reason TEXT NOT NULL, ref TEXT DEFAULT '', note TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_moves ON stock_moves (outlet_id, item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_moves_ref ON stock_moves (ref);
-
 -- 批次：每次入库生成一个批次；出库按"先到期先出"(FEFO) 从批次里扣
 CREATE TABLE IF NOT EXISTS lots (
-  id INTEGER PRIMARY KEY, lot_no TEXT NOT NULL,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, lot_no TEXT NOT NULL,
   outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   item_type TEXT NOT NULL, item_id INTEGER NOT NULL,
-  qty REAL NOT NULL, remaining REAL NOT NULL, expiry TEXT,
+  qty DOUBLE PRECISION NOT NULL, remaining DOUBLE PRECISION NOT NULL, expiry TEXT,
   created_at TEXT NOT NULL, source TEXT NOT NULL, ref TEXT DEFAULT '', supplier_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_lots ON lots (outlet_id, item_type, item_id);
+CREATE INDEX IF NOT EXISTS idx_lots_no ON lots (lot_no);
 -- 哪条流水动了哪个批次、动了多少
 CREATE TABLE IF NOT EXISTS lot_moves (
-  id INTEGER PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id), move_id INTEGER NOT NULL REFERENCES stock_moves(id), qty REAL NOT NULL
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, lot_id INTEGER NOT NULL REFERENCES lots(id),
+  move_id INTEGER NOT NULL REFERENCES stock_moves(id), qty DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lot_moves ON lot_moves (lot_id);
 CREATE INDEX IF NOT EXISTS idx_lot_moves_m ON lot_moves (move_id);
@@ -118,138 +242,123 @@ CREATE TABLE IF NOT EXISTS lot_links (
   parent_lot_id INTEGER NOT NULL REFERENCES lots(id), child_lot_id INTEGER NOT NULL REFERENCES lots(id),
   PRIMARY KEY (parent_lot_id, child_lot_id)
 );
-
 -- 每个门店对每个库存品的设置：最低量、par、储位
 CREATE TABLE IF NOT EXISTS par_levels (
-  outlet_id INTEGER NOT NULL, item_type TEXT NOT NULL, item_id INTEGER NOT NULL,
-  min_qty REAL NOT NULL DEFAULT 0, par_qty REAL NOT NULL DEFAULT 0, location TEXT NOT NULL DEFAULT '',
+  outlet_id INTEGER NOT NULL REFERENCES outlets(id), item_type TEXT NOT NULL, item_id INTEGER NOT NULL,
+  min_qty DOUBLE PRECISION NOT NULL DEFAULT 0, par_qty DOUBLE PRECISION NOT NULL DEFAULT 0, location TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (outlet_id, item_type, item_id)
 );
-
--- 盘点：一次盘点 (count) 下可以有多个分盘 (sub-count，多人/分区同时盘)，合计后覆盖库存
+-- 盘点：一次盘点下可以有多个分盘，合计后覆盖库存
 CREATE TABLE IF NOT EXISTS stock_counts (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', approved_at TEXT
 );
 CREATE TABLE IF NOT EXISTS count_subs (
-  id INTEGER PRIMARY KEY, count_id INTEGER NOT NULL REFERENCES stock_counts(id) ON DELETE CASCADE, name TEXT NOT NULL
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, count_id INTEGER NOT NULL REFERENCES stock_counts(id) ON DELETE CASCADE, name TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS count_entries (
-  id INTEGER PRIMARY KEY, sub_id INTEGER NOT NULL REFERENCES count_subs(id) ON DELETE CASCADE,
-  item_type TEXT NOT NULL, item_id INTEGER NOT NULL, qty REAL NOT NULL
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, sub_id INTEGER NOT NULL REFERENCES count_subs(id) ON DELETE CASCADE,
+  item_type TEXT NOT NULL, item_id INTEGER NOT NULL, qty DOUBLE PRECISION NOT NULL
 );
--- 确认后的结果快照 (账面 / 实盘)
 CREATE TABLE IF NOT EXISTS count_lines (
-  id INTEGER PRIMARY KEY, count_id INTEGER NOT NULL REFERENCES stock_counts(id) ON DELETE CASCADE,
-  item_type TEXT NOT NULL, item_id INTEGER NOT NULL, expected REAL NOT NULL, counted REAL NOT NULL, unit_cost REAL NOT NULL DEFAULT 0
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, count_id INTEGER NOT NULL REFERENCES stock_counts(id) ON DELETE CASCADE,
+  item_type TEXT NOT NULL, item_id INTEGER NOT NULL, expected DOUBLE PRECISION NOT NULL, counted DOUBLE PRECISION NOT NULL,
+  unit_cost DOUBLE PRECISION NOT NULL DEFAULT 0
 );
-
 CREATE TABLE IF NOT EXISTS transfers (
-  id INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, ts TEXT NOT NULL,
   from_outlet INTEGER NOT NULL REFERENCES outlets(id), to_outlet INTEGER NOT NULL REFERENCES outlets(id),
-  item_type TEXT NOT NULL, item_id INTEGER NOT NULL, qty REAL NOT NULL, note TEXT DEFAULT ''
+  item_type TEXT NOT NULL, item_id INTEGER NOT NULL, qty DOUBLE PRECISION NOT NULL, note TEXT DEFAULT ''
 );
 
--- ══════════ 采购 ══════════
--- status: in_progress 购物车 → (waiting_approval 待审批 → rejected 被拒) → sent 已发送 → partial 部分到货 → delivered 已到货
+-- ── 采购 ──
+-- status: in_progress → (waiting_approval → rejected) → sent → partial → delivered
 CREATE TABLE IF NOT EXISTS purchase_orders (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
   status TEXT NOT NULL DEFAULT 'in_progress', created_at TEXT NOT NULL, sent_at TEXT, closed_at TEXT,
   flag_note TEXT DEFAULT '', reject_reason TEXT DEFAULT '', approver_note TEXT DEFAULT '',
-  invoice_no TEXT DEFAULT '', invoice_amount REAL, invoice_status TEXT DEFAULT 'not_received',
-  delivery_fee REAL NOT NULL DEFAULT 0
+  invoice_no TEXT DEFAULT '', invoice_amount DOUBLE PRECISION, invoice_status TEXT DEFAULT 'not_received',
+  delivery_fee DOUBLE PRECISION NOT NULL DEFAULT 0, created_by TEXT DEFAULT '', approved_by TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS po_lines (
-  id INTEGER PRIMARY KEY, po_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, po_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
   package_id INTEGER NOT NULL REFERENCES packages(id),
-  qty_packs REAL NOT NULL, price REAL NOT NULL, received_packs REAL NOT NULL DEFAULT 0, received_value REAL NOT NULL DEFAULT 0
+  qty_packs DOUBLE PRECISION NOT NULL, price DOUBLE PRECISION NOT NULL,
+  received_packs DOUBLE PRECISION NOT NULL DEFAULT 0, received_value DOUBLE PRECISION NOT NULL DEFAULT 0
 );
-
--- 内部订货：门店向"内部供应商"(中央厨房) 订可入库的半成品
--- status: incoming 新订单 → picked 已拣货 → shipped 已发货 → received 门店已收货
+-- 内部订货：门店向内部供应商 (中央厨房) 订可入库的半成品
+-- status: incoming → picked → shipped → received
 CREATE TABLE IF NOT EXISTS internal_orders (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   supplier_outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   status TEXT NOT NULL DEFAULT 'incoming', created_at TEXT NOT NULL, shipped_at TEXT, received_at TEXT, note TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS internal_order_lines (
-  id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES internal_orders(id) ON DELETE CASCADE,
-  item_type TEXT NOT NULL DEFAULT 'recipe', item_id INTEGER NOT NULL, qty REAL NOT NULL, picked_qty REAL
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES internal_orders(id) ON DELETE CASCADE,
+  item_type TEXT NOT NULL DEFAULT 'recipe', item_id INTEGER NOT NULL, qty DOUBLE PRECISION NOT NULL, picked_qty DOUBLE PRECISION
 );
 
--- ══════════ 生产 ══════════
--- status: draft 草稿 → active 进行中 → done 已完成
+-- ── 生产 ── status: draft → active → done；任务 todo → doing → done
 CREATE TABLE IF NOT EXISTS production_plans (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   name TEXT NOT NULL, plan_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL, finished_at TEXT
 );
--- 任务：做某个配方 (recipe_id) 或自定义任务 (只有 title，比如"清洁")；status: todo → doing → done
 CREATE TABLE IF NOT EXISTS production_tasks (
-  id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES production_plans(id) ON DELETE CASCADE,
-  recipe_id INTEGER REFERENCES recipes(id), title TEXT DEFAULT '', qty REAL NOT NULL DEFAULT 0,
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES production_plans(id) ON DELETE CASCADE,
+  recipe_id INTEGER REFERENCES recipes(id), title TEXT DEFAULT '', qty DOUBLE PRECISION NOT NULL DEFAULT 0,
   assignee TEXT DEFAULT '', workstation TEXT DEFAULT '',
   status TEXT NOT NULL DEFAULT 'todo', started_at TEXT, done_at TEXT,
-  produced_qty REAL, lot_no TEXT, expiry TEXT
+  produced_qty DOUBLE PRECISION, lot_no TEXT, expiry TEXT
 );
 
--- ══════════ 任务与 HACCP ══════════
+-- ── 任务与 HACCP ──
 CREATE TABLE IF NOT EXISTS ccps (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'other', description TEXT DEFAULT ''
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, code TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'other', description TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS tasks (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'general', ccp_id INTEGER REFERENCES ccps(id), description TEXT DEFAULT '',
-  frequency TEXT NOT NULL DEFAULT 'daily',   -- inactive | once | daily | weekly | monthly
-  weekdays TEXT NOT NULL DEFAULT '[]',       -- weekly 用：[1,3,5]，0=周日
-  month_day INTEGER,                         -- monthly 用
+  frequency TEXT NOT NULL DEFAULT 'daily', weekdays TEXT NOT NULL DEFAULT '[]', month_day INTEGER,
   start_date TEXT NOT NULL, end_date TEXT, time TEXT DEFAULT '',
-  min_val REAL, max_val REAL,                -- 温度检查的上下限
+  min_val DOUBLE PRECISION, max_val DOUBLE PRECISION,
   checklist TEXT NOT NULL DEFAULT '[]', assignee TEXT DEFAULT ''
 );
--- 一次执行记录。ok=0 表示异常 (超出限值 / 清单未全部完成)
 CREATE TABLE IF NOT EXISTS task_logs (
-  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  day TEXT NOT NULL, value REAL, checks TEXT NOT NULL DEFAULT '[]', remarks TEXT DEFAULT '',
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  day TEXT NOT NULL, value DOUBLE PRECISION, checks TEXT NOT NULL DEFAULT '[]', remarks TEXT DEFAULT '',
   done_by TEXT DEFAULT '', done_at TEXT NOT NULL, ok INTEGER NOT NULL DEFAULT 1,
   UNIQUE (task_id, day)
 );
 
--- ══════════ 销售 ══════════
--- POS 商品 (按 PLU 识别)。一个 PLU 关联一个配方；没关联的卖了也不会扣库存、不会算成本
+-- ── 销售 ──
 CREATE TABLE IF NOT EXISTS pos_items (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   plu TEXT NOT NULL, name TEXT NOT NULL, category TEXT DEFAULT '',
   recipe_id INTEGER REFERENCES recipes(id), ignored INTEGER NOT NULL DEFAULT 0,
   UNIQUE (outlet_id, plu)
 );
 CREATE TABLE IF NOT EXISTS sales (
-  id INTEGER PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
+  id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, outlet_id INTEGER NOT NULL REFERENCES outlets(id),
   day TEXT NOT NULL, pos_item_id INTEGER REFERENCES pos_items(id), recipe_id INTEGER REFERENCES recipes(id),
-  qty REAL NOT NULL, revenue REAL NOT NULL, discount REAL NOT NULL DEFAULT 0,
-  depleted INTEGER NOT NULL DEFAULT 0      -- 是否已按配方扣过库存
+  qty DOUBLE PRECISION NOT NULL, revenue DOUBLE PRECISION NOT NULL, discount DOUBLE PRECISION NOT NULL DEFAULT 0,
+  depleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sales ON sales (outlet_id, day);
-`);
+`;
 
-export const all = (sql, ...p) => db.prepare(sql).all(...p);
-export const get = (sql, ...p) => db.prepare(sql).get(...p);
-export const run = (sql, ...p) => db.prepare(sql).run(...p);
-export const ins = (sql, ...p) => Number(db.prepare(sql).run(...p).lastInsertRowid);
+async function migrate() {
+  for (const stmt of DDL.split(';').map((s) => s.replace(/--.*$/gm, '').trim()).filter(Boolean)) await driver.query(stmt);
+}
 
-// 事务：一组写入要么全成功要么全回滚（可嵌套，只有最外层真正提交）
-let depth = 0;
-export function tx(fn) {
-  if (depth === 0) db.exec('BEGIN');
-  depth++;
-  try {
-    const r = fn();
-    depth--;
-    if (depth === 0) db.exec('COMMIT');
-    return r;
-  } catch (e) {
-    depth--;
-    if (depth === 0) db.exec('ROLLBACK');
-    throw e;
-  }
+// 业务数据表 (清空数据时用)；不含账号、会话、操作记录、设置
+export const BUSINESS_TABLES = ['task_logs', 'tasks', 'ccps', 'sales', 'pos_items', 'production_tasks', 'production_plans', 'internal_order_lines',
+  'internal_orders', 'po_lines', 'purchase_orders', 'transfers', 'count_lines', 'count_entries', 'count_subs', 'stock_counts', 'par_levels',
+  'lot_links', 'lot_moves', 'lots', 'stock_moves', 'menu_items', 'menus', 'recipe_lines', 'recipes', 'package_prices', 'packages',
+  'ingredients', 'suppliers', 'outlets'];
+export async function truncateBusiness() {
+  await run(`TRUNCATE ${BUSINESS_TABLES.filter((t) => t !== 'outlets').join(', ')} RESTART IDENTITY CASCADE`);
+  // 门店编号不重新计数：账号上按编号记着"能看哪些门店"，旧编号绝不能落到新门店头上
+  await run('TRUNCATE outlets CASCADE');
+  store().shared.cat = null;
 }

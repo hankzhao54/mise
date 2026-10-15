@@ -213,7 +213,7 @@ export function Tasks() {
                 <td className="r nowrap">
                   {o.task.type === 'order' && <a className="link" href="#orders">{L('去订货', 'Create order')}</a>}
                   {o.task.type === 'count' && <a className="link" href="#counts">{L('去盘点', 'Count inventory')}</a>}
-                  <button className="link" onClick={() => setDoing({ ...o, value: o.log?.value ?? '', checks: o.log?.checks?.length ? o.log.checks : o.task.checklist.map(() => false), remarks: o.log?.remarks || '', done_by: o.log?.done_by || o.task.assignee || '' })}>{o.log ? L('修改', 'Edit') : L('完成', 'Complete')}</button>
+                  <button className="link" onClick={() => setDoing({ ...o, value: o.log?.value ?? '', checks: o.log?.checks?.length ? o.log.checks : o.task.checklist.map(() => false), remarks: o.log?.remarks || '', done_by: o.log?.done_by || meta.me.display_name })}>{o.log ? L('修改', 'Edit') : L('完成', 'Complete')}</button>
                 </td></tr>))}</tbody></table>)}
       </section>}
 

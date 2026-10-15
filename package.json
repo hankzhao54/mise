@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "description": "Mise — 学习用的餐饮后厨管理系统 (配方成本 / 库存采购 / 生产计划 / 菜单工程)",
   "scripts": {
     "start": "node server/server.js",
@@ -14,7 +16,9 @@
     "test": "node server/test.js"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.10",
     "express": "^5.3.0",
+    "pg": "^8.23.1",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

@@ -13,7 +13,10 @@ services:
         value: "22"
       - key: TZ
         value: Europe/Budapest
+      - key: DATABASE_URL
+        sync: false   # Supabase 的 Session pooler 连接串，在 Render 后台填，不写进代码
+      # 第一次启动时建管理员账号用 (用户名 mise，密码 = BASIC_PASS)；之后改密码在网页里改
       - key: BASIC_USER
         value: mise
       - key: BASIC_PASS
-        sync: false   # 创建时 Render 会让你填，不写进代码
+        sync: false

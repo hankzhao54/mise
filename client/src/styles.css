@@ -105,3 +105,24 @@ tfoot td { border-top: 2px solid var(--line); background: #faf8f3; font-size: 12
 a { color: var(--accent); } a.link { text-decoration: none; padding: 2px 6px; }
 .modal .modal { box-shadow: 0 10px 40px rgba(0,0,0,.35); }
 @media (max-width: 860px) { .board { grid-template-columns: 1fr; } .nav-sep { display: none; } }
+
+/* ── 登录与账号 ── */
+.login { min-height: 100vh; display: grid; place-items: center; padding: 16px; background: #17231d; }
+.login-card { width: 100%; max-width: 340px; background: var(--panel); border-radius: 12px; padding: 28px; display: grid; gap: 14px; }
+.login-card input { width: 100%; }
+.login-brand { font-size: 26px; font-weight: 700; color: var(--accent); } .login-brand span { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+.login-err { background: var(--bad-soft); color: var(--bad); border-radius: 7px; padding: 8px 10px; font-size: 13px; }
+.login-lang { justify-self: start; }
+.user-menu { position: relative; } .user-menu > button { display: flex; align-items: center; gap: 6px; }
+.user-pop { position: absolute; right: 0; top: calc(100% + 6px); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; box-shadow: 0 6px 20px rgba(0,0,0,.08); min-width: 200px; padding: 6px; z-index: 20; }
+.user-pop .who { padding: 6px 10px 8px; border-bottom: 1px solid var(--line); margin-bottom: 4px; font-size: 12px; color: var(--muted); }
+.user-pop button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 7px 10px; }
+.user-pop button:hover { background: #f3f1ea; }
+.header-left { margin-right: auto; display: flex; align-items: center; gap: 10px; }
+button.danger-btn { background: var(--bad); border-color: var(--bad); color: #fff; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; } .clip { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.no-outlet { padding: 40px 28px; }
+@media (max-width: 760px) {
+  .shell { flex-direction: column; } aside { width: auto; height: auto; position: static; }
+  header { padding: 10px 16px; flex-wrap: wrap; } .page { padding: 18px 16px 48px; }
+}

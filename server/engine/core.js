@@ -1,5 +1,9 @@
 // 核心：设置、单位换算、配方成本、配方展开。其他模块都建立在这上面。
-import { all, get, run } from '../db.js';
+//
+// 性能上的一个安排：配方、原料、包装、设置这些"主数据"在每个请求开始时一次性读进内存 (目录 catalog)，
+// 之后的成本计算、配方展开都是纯内存运算，不再逐行查数据库。
+// 主数据被修改后调用 refresh() 重新读一次。
+import { all, run, store } from '../db.js';
 
 // 时间一律用【本机时区】的 ISO 字符串 (不带 Z)。这样"某一天"的含义和餐厅的营业日一致，
 // 按 substr(ts,1,10) 取日期做报表也不会被时区搞错。
@@ -26,22 +30,45 @@ export const DEFAULTS = {
   waste_reasons: ['过期 Expired', '备料损耗 Prep waste', '做错/退菜 Mistake', '掉落损坏 Dropped', '试菜/员工餐 Tasting'],
   workstations: ['汤锅 Stock pot', '面点 Dough', '热厨 Hot line', '冷厨 Cold'],
 };
-let cache = null;
-export function settings() {
-  if (!cache) {
-    cache = { ...DEFAULTS };
-    for (const r of all('SELECT * FROM settings')) cache[r.key] = JSON.parse(r.value);
-  }
-  return cache;
+
+// ───────────────────────── 目录 (主数据缓存) ─────────────────────────
+async function loadCatalog() {
+  const [st, ings, pkgs, recs, lines, outlets] = await Promise.all([
+    all('SELECT * FROM settings'), all('SELECT * FROM ingredients'), all('SELECT * FROM packages ORDER BY id'),
+    all('SELECT * FROM recipes'), all('SELECT * FROM recipe_lines ORDER BY id'), all('SELECT * FROM outlets ORDER BY id')]);
+  const settings = { ...DEFAULTS };
+  for (const r of st) settings[r.key] = JSON.parse(r.value);
+  const group = (rows, key) => { const m = new Map(); for (const r of rows) { if (!m.has(r[key])) m.set(r[key], []); m.get(r[key]).push(r); } return m; };
+  return {
+    settings,
+    ingredients: new Map(ings.map((i) => [i.id, { ...i, allergens: JSON.parse(i.allergens) }])),
+    packages: group(pkgs, 'ingredient_id'),
+    recipes: new Map(recs.map((r) => [r.id, r])),
+    lines: group(lines, 'recipe_id'),
+    outlets: new Map(outlets.map((o) => [o.id, o])),
+  };
 }
-export function saveSettings(patch) {
+// 每个异步入口先 await ready()，之后同一请求里的同步函数都能用目录
+export async function ready() {
+  const s = store().shared;
+  if (!s.cat) s.cat = await loadCatalog();
+  return s.cat;
+}
+export async function refresh() { store().shared.cat = null; return ready(); }
+function C() {
+  const c = store().shared.cat;
+  if (!c) fail('internal: catalog not loaded (call ready() first)');
+  return c;
+}
+export const settings = () => C().settings;
+export async function saveSettings(patch) {
   for (const k of Object.keys(patch)) {
     if (!(k in DEFAULTS)) continue;
-    run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', k, JSON.stringify(patch[k]));
+    await run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=excluded.value', k, JSON.stringify(patch[k]));
   }
-  cache = null;
+  return (await refresh()).settings;
 }
-export const resetSettingsCache = () => { cache = null; };
+export const outletOf = (id) => C().outlets.get(id);
 
 // ───────────────────────── 单位 ─────────────────────────
 // 每个单位属于一个量纲，并有一个换算到基础单位的系数。不同量纲之间不能换算。
@@ -61,11 +88,13 @@ export function toBase(qty, unit, baseUnit) {
 // ───────────────────────── 成本 ─────────────────────────
 // 用哪个包装的价格来算成本：默认取"单位价最便宜"的；也可以设成"最近一次订的"
 export function costingPackage(ingredientId) {
+  const pk = C().packages.get(ingredientId) || [];
+  if (!pk.length) return undefined;
   if (settings().cost_basis === 'last_ordered') {
-    const p = get('SELECT * FROM packages WHERE ingredient_id=? AND last_ordered_at IS NOT NULL ORDER BY last_ordered_at DESC LIMIT 1', ingredientId);
-    if (p) return p;
+    const lo = pk.filter((p) => p.last_ordered_at).sort((a, b) => b.last_ordered_at.localeCompare(a.last_ordered_at))[0];
+    if (lo) return lo;
   }
-  return get('SELECT * FROM packages WHERE ingredient_id=? ORDER BY price/pack_qty ASC, id LIMIT 1', ingredientId);
+  return [...pk].sort((a, b) => a.price / a.pack_qty - b.price / b.pack_qty || a.id - b.id)[0];
 }
 // 原料单位成本 = 包装价格 / 包装含量 (6500 Ft / 25000 g = 0.26 Ft/g)
 export function ingredientUnitCost(id) {
@@ -82,16 +111,16 @@ export function recipeCost(id, memo = new Map(), stack = []) {
   if (stack.includes(id)) fail('配方循环引用 circular recipe reference');
   if (memo.has(id)) return memo.get(id);
   const S = settings();
-  const r = get('SELECT * FROM recipes WHERE id=?', id) || fail(`配方不存在 recipe ${id} not found`);
+  const r = C().recipes.get(id) || fail(`配方不存在 recipe ${id} not found`);
   const allergens = new Set();
   let depth = 0;
-  const lines = all('SELECT * FROM recipe_lines WHERE recipe_id=? ORDER BY id', id).map((l) => {
+  const lines = (C().lines.get(id) || []).map((l) => {
     let info, unitCost, labourPerUnit = 0, children = null, wastePct, wasteSrc;
     if (l.ingredient_id) {
-      const ing = get('SELECT * FROM ingredients WHERE id=?', l.ingredient_id);
+      const ing = C().ingredients.get(l.ingredient_id);
       info = { item_type: 'ingredient', item_id: ing.id, name_zh: ing.name_zh, name_en: ing.name_en, base_unit: ing.base_unit, stockable: 1 };
       unitCost = ingredientUnitCost(ing.id);
-      JSON.parse(ing.allergens).forEach((a) => allergens.add(a));
+      ing.allergens.forEach((a) => allergens.add(a));
       [wastePct, wasteSrc] = l.waste_pct != null ? [l.waste_pct, 'line'] : ing.waste_pct != null ? [ing.waste_pct, 'ingredient'] : [S.default_waste_pct, 'library'];
     } else {
       const sub = recipeCost(l.sub_recipe_id, memo, [...stack, id]);
@@ -155,10 +184,12 @@ export function explode(recipeId, qty, out = new Map(), memo = new Map()) {
 }
 
 export function itemInfo(type, id) {
-  const row = type === 'ingredient'
-    ? get('SELECT name_zh, name_en, base_unit AS unit, category FROM ingredients WHERE id=?', id)
-    : get('SELECT name_zh, name_en, yield_unit AS unit, category, shelf_life_days FROM recipes WHERE id=?', id);
-  return row || fail(`找不到 item not found: ${type} ${id}`);
+  if (type === 'ingredient') {
+    const i = C().ingredients.get(id) || fail(`找不到原料 ingredient not found: ${id}`);
+    return { name_zh: i.name_zh, name_en: i.name_en, unit: i.base_unit, category: i.category };
+  }
+  const r = C().recipes.get(id) || fail(`找不到配方 recipe not found: ${id}`);
+  return { name_zh: r.name_zh, name_en: r.name_en, unit: r.yield_unit, category: r.category, shelf_life_days: r.shelf_life_days };
 }
 // 库存计价用食材成本 (不含人工)
 export const unitCost = (type, id, memo) =>
